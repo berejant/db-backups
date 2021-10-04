@@ -1,0 +1,36 @@
+version: '3.7'
+
+services:
+  percona:
+    container_name: percona
+    image: percona/percona-server:8.0
+    environment:
+      - MYSQL_DATABASE=${PERCONA_DATABASE}
+      - MYSQL_ROOT_PASSWORD=${PERCONA_ROOT_PASSWORD}
+      - MYSQL_USER=${PERCONA_USER}
+      - MYSQL_PASSWORD=${PERCONA_PASSWORD}
+    volumes:
+      - percona-data:/var/lib/mysql
+      - ./populate.sql.gz:/docker-entrypoint-initdb.d/populate.sql.gz
+    ports:
+      - "${PERCONA_PORT}:3306"
+
+  percona-xtrabackup:
+    container_name: percona-xtrabackup
+    build:
+      context: ./percona-xtrabackup
+    image: percona/percona-xtrabackup
+    environment:
+      - MYSQL_DATABASE=${PERCONA_DATABASE}
+      - MYSQL_ROOT_PASSWORD=${PERCONA_ROOT_PASSWORD}
+      - MYSQL_USER=${PERCONA_USER}
+      - MYSQL_PASSWORD=${PERCONA_PASSWORD}
+    volumes:
+      - percona-data:/var/lib/mysql
+      - ./backup:/backup
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8080:80"
+
+volumes:
+  percona-data:
