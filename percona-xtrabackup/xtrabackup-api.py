@@ -3,14 +3,19 @@ from http.server import HTTPServer
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 import os
+import sys
 import time
 import subprocess
+import signal
 from urllib.parse import parse_qs
 import shutil
 
 BACKUP_DIR = '/backup'
+TMP_BACKUP_DIR = '/tmp/backup'
 DATA_DIR = '/var/lib/mysql'
+shutil.rmtree(TMP_BACKUP_DIR, ignore_errors=True)
 Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+httpd = None
 
 
 def print_backups_list():
@@ -61,45 +66,53 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         source_base = os.path.join(BACKUP_DIR, backup_dir)
         print(source_base + "\n")
 
-        tmp_backup_dir = os.path.join("/tmp", backup_dir)
+        shutil.rmtree(TMP_BACKUP_DIR, ignore_errors=True)
+        Path(TMP_BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+
+        tmp_backup_dir = os.path.join(TMP_BACKUP_DIR, backup_dir)
         shutil.rmtree(tmp_backup_dir, ignore_errors=True)
         shutil.copytree(source_base, tmp_backup_dir)
 
-        subprocess.run([
-            "xtrabackup", "--prepare", "--apply-log-only", "--target-dir=" + tmp_backup_dir,
-        ], check=True)
-
-        incremental_dir = backup_dir
-        while incremental_dirs:
-            incremental_dir = incremental_dirs.pop() + "_based_on_" + incremental_dir
-            tmp_incremental_dir = os.path.join("/tmp", incremental_dir)
-            shutil.rmtree(tmp_incremental_dir, ignore_errors=True)
-            shutil.copytree(os.path.join(BACKUP_DIR, incremental_dir), tmp_incremental_dir)
+        if incremental_dirs:
             subprocess.run([
-                "xtrabackup", "--prepare",  "--apply-log-only",
-                "--target-dir=" + tmp_backup_dir,
-                "--incremental-dir=" + tmp_incremental_dir
+                "xtrabackup", "--prepare", "--apply-log-only", "--target-dir=" + tmp_backup_dir,
             ], check=True)
-            shutil.rmtree(tmp_incremental_dir, ignore_errors=True)
 
-        subprocess.run(["docker", "stop", "percona"], check=True)
-        for filename in os.listdir(DATA_DIR):
-            file_path = os.path.join(DATA_DIR, filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-            except Exception as e:
-                print('Failed to delete %s. Reason: %s' % (file_path, e))
+            incremental_dir = backup_dir
+            while incremental_dirs:
+                incremental_dir = incremental_dirs.pop() + "_based_on_" + incremental_dir
+                tmp_incremental_dir = os.path.join(TMP_BACKUP_DIR, incremental_dir)
+                shutil.copytree(os.path.join(BACKUP_DIR, incremental_dir), tmp_incremental_dir)
+                subprocess.run([
+                    "xtrabackup", "--prepare", "--apply-log-only",
+                    "--target-dir=" + tmp_backup_dir,
+                    "--incremental-dir=" + tmp_incremental_dir
+                ], check=True)
 
         subprocess.run([
-            "xtrabackup", "--copy-back", "--datadir=" + DATA_DIR, "--target-dir=" + tmp_backup_dir
+            "xtrabackup", "--prepare", "--target-dir=" + tmp_backup_dir,
         ], check=True)
-        shutil.rmtree(tmp_backup_dir, ignore_errors=True)
 
-        subprocess.run(['chown', '-R', '1001:1001', DATA_DIR], check=True)
-        subprocess.run(["docker", "start", "percona"], check=True)
+        try:
+            subprocess.run(["docker", "stop", "percona"], check=True)
+            for filename in os.listdir(DATA_DIR):
+                file_path = os.path.join(DATA_DIR, filename)
+                try:
+                    if os.path.isfile(file_path) or os.path.islink(file_path):
+                        os.unlink(file_path)
+                    elif os.path.isdir(file_path):
+                        shutil.rmtree(file_path)
+                except Exception as e:
+                    print('Failed to delete %s. Reason: %s' % (file_path, e))
+
+            subprocess.run([
+                "xtrabackup", "--copy-back", "--datadir=" + DATA_DIR, "--target-dir=" + tmp_backup_dir
+            ], check=True)
+            shutil.rmtree(TMP_BACKUP_DIR, ignore_errors=True)
+
+            subprocess.run(['chown', '-R', '1001:1001', DATA_DIR], check=True)
+        finally:
+            subprocess.run(["docker", "start", "percona"], check=True)
 
     def do_backup(self, new_backup_name, incremental_base_name=None):
         xtrabackup_command = [
@@ -172,6 +185,14 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-print("Hello!\n")
-httpd = HTTPServer(('0.0.0.0', 80), SimpleHTTPRequestHandler)
-httpd.serve_forever()
+def terminate(signal, frame):
+    print("Start Terminating: %s")
+    httpd.server_close()
+    shutil.rmtree(TMP_BACKUP_DIR, ignore_errors=True)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, terminate)
+    httpd = HTTPServer(('0.0.0.0', 80), SimpleHTTPRequestHandler)
+    httpd.serve_forever()
